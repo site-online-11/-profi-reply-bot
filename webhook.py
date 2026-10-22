@@ -105,7 +105,7 @@ class WebhookApp(App):
                 {'command': 'help', 'description': 'Как пользоваться'},
                 {'command': 'usage', 'description': 'Моя статистика'},
                 {'command': 'admin', 'description': 'Админка'},
-                {'command': 'privacy', 'description': 'Данные'}])
+                {'command': 'agreement', 'description': 'Пользовательское соглашение'}])
             log.info('Webhook active for @%s', self.username)
             while not self.stopping.wait(15):
                 if not worker.is_alive():

@@ -16,13 +16,11 @@ from transport import Telegram, APIError
 log = logging.getLogger('bot')
 HELP = ('Пришлите текст объявления или скриншот (фото либо PNG/JPEG/WebP до 10 МБ). '
         'Я подготовлю персональный отклик до 500 символов. Если это найм, предупрежу и всё равно предложу ответ.\n\n'
-        'Текст в цитате можно выделить и скопировать. Кнопка под длинным ответом открывает отдельный блок для копирования.\n'
-        '/usage — ваши генерации\n/privacy — данные\n/delete_data — удалить данные')
-PRIVACY = ('Сохраняются Telegram ID, имя, username, первый и последний источник перехода, даты активности и счётчики. '
-           'Источник определяется только параметром ссылки /start; без него — direct. '
-           'Текст и изображения передаются OpenAI для генерации. Изображения отдельно не сохраняются; очередь входящих очищается после обработки. '
-           'Готовые ответы хранятся 7 дней, события — 180 дней, статистика — до удаления данных. '
-           '/delete_data удаляет ваши данные из базы бота. Удаление не удаляет сообщения из Telegram и данные у внешнего API.')
+        'Готовый текст сразу появится в блоке для копирования. Под ним можно выбрать другой вариант или вариант со смайликами.\n'
+        '/usage — ваши генерации\n/agreement — пользовательское соглашение')
+START = 'Нажимая «Начать» или продолжая пользоваться ботом, вы принимаете пользовательское соглашение: /agreement.\n\n' + HELP
+AGREEMENT = Path(__file__).with_name('agreement.txt').read_text()
+
 
 class App:
     def __init__(self):
@@ -34,7 +32,7 @@ class App:
         self.tg = Telegram(os.environ['BOT_TOKEN'])
         self.ai = Generator(os.environ['OPENAI_API_KEY'], os.getenv('OPENAI_MODEL', 'gpt-4.1-mini'))
         self.claim_code = os.getenv('ADMIN_CLAIM_CODE', '')
-        self.user_limit = int(os.getenv('USER_DAILY_LIMIT', '30'))
+        self.user_limit = int(os.getenv('USER_DAILY_LIMIT', '60'))
         self.global_limit = int(os.getenv('GLOBAL_DAILY_LIMIT', '300'))
         self.profile = Path(__file__).with_name('profile.txt').read_text()
         self.last_poll = time.time()
@@ -101,7 +99,22 @@ class App:
         if cb:
             data = cb.get('data','')
             self.tg.call('answerCallbackQuery',callback_query_id=cb['id'])
-            if data.startswith('copy:'):
+            if data == 'agreement':
+                self.send(uid, AGREEMENT)
+            elif data.startswith(('alt:', 'emoji:')):
+                try:
+                    style, original = data.split(':', 1)
+                    original = int(original)
+                except ValueError:
+                    return
+                saved = self.db.saved_input(original, uid)
+                previous = self.db.saved_reply(original, uid)
+                if not saved:
+                    self.send(uid, 'Пришлите объявление ещё раз, чтобы создать новый вариант.')
+                    return
+                message = {'chat': m['chat'], 'from': cb['from'], **saved}
+                self.handle({'update_id': u['update_id'], 'message': message, 'variant': style, 'previous_reply': previous})
+            elif data.startswith('copy:'):
                 reply = self.db.saved_reply(int(data.split(':')[1]),uid)
                 self.send(uid, '<pre>'+html.escape(reply)+'</pre>' if reply else 'Ответ уже удалён. Пришлите объявление ещё раз.', formatted=bool(reply))
             elif data == 'delete:yes':
@@ -119,12 +132,14 @@ class App:
             if cmd=='/start' and arg.startswith('admin_'):
                 claimed=self.db.claim(uid,arg[6:],self.claim_code)
                 self.send(uid,'Вы администратор. Откройте /admin.' if claimed else 'Ссылка администратора недействительна или уже использована.')
-            elif cmd in ('/start','/help'):
+            elif cmd=='/start':
+                self.send(uid,START,[[{'text':'Пользовательское соглашение','callback_data':'agreement'}]])
+            elif cmd=='/help':
                 self.send(uid,HELP)
-            elif cmd=='/privacy': self.send(uid,PRIVACY)
+            elif cmd in ('/agreement','/privacy'): self.send(uid,AGREEMENT)
             elif cmd=='/usage':
                 c=self.db.counts(uid)
-                self.send(uid,f"Запросов: {c['requests']}\nОтветов: {c['success']}\nВызовов ИИ: {c['api_calls']}\nДневной лимит: {self.user_limit} вызовов ИИ.")
+                self.send(uid,f"Запросов: {c['requests']}\nОтветов: {c['success']}\nВызовов ИИ: {c['api_calls']}\nДневной лимит: {self.user_limit} запросов (включая варианты).")
             elif cmd=='/delete_data':
                 self.send(uid,'Удалить ваши данные и сохранённые ответы?',[[{'text':'Да, удалить','callback_data':'delete:yes'}]])
             elif cmd in ('/admin','/stats','/users','/user','/sources','/source','/export','/profile','/set_profile','/block','/unblock'):
@@ -156,6 +171,7 @@ class App:
             return
         if not self.db.request(rid,uid,'image' if photo or document else 'text'):
             return
+        self.db.save_input(rid, m)
         try:
             images=[]
             if photo or document:
@@ -164,7 +180,7 @@ class App:
                     raise ValueError('Изображение больше 10 МБ. Пришлите его как фото.')
                 images=[self.tg.file(file['file_id'])]
             self.tg.call('sendChatAction',chat_id=uid,action='typing')
-            result=self.ai.generate(text or m.get('caption',''),images,self.db.get('profile',self.profile),lambda:self.db.reserve_call(rid,uid,self.user_limit,self.global_limit),self.db.call_done)
+            result=self.ai.generate(text or m.get('caption',''),images,self.db.get('profile',self.profile),lambda:self.db.reserve_call(rid,uid,self.user_limit,self.global_limit),self.db.call_done,style=u.get('variant'),previous=u.get('previous_reply'))
             self.db.result(rid,result)
             body,kb=presentation(result,rid)
             self.send(uid,body,kb,True)
@@ -204,7 +220,7 @@ class App:
             raise RuntimeError('Existing webhook found. Stop the previous deployment before switching to polling.')
         self.db.recover()
         self.db.cleanup()
-        self.tg.call('setMyCommands',commands=[{'command':'start','description':'Создать отклик'},{'command':'help','description':'Как пользоваться'},{'command':'usage','description':'Моя статистика'},{'command':'admin','description':'Админка'},{'command':'privacy','description':'Данные и конфиденциальность'}])
+        self.tg.call('setMyCommands',commands=[{'command':'start','description':'Создать отклик'},{'command':'help','description':'Как пользоваться'},{'command':'usage','description':'Моя статистика'},{'command':'admin','description':'Админка'},{'command':'agreement','description':'Пользовательское соглашение'}])
         worker=threading.Thread(target=self.worker,daemon=True)
         worker.start()
         app=self

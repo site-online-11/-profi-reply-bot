@@ -29,6 +29,9 @@ SCHEMA = '''
           id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
           kind TEXT, status TEXT NOT NULL, classification TEXT, reply TEXT, warning TEXT,
           error_code TEXT, created REAL NOT NULL, delivered REAL);
+        CREATE TABLE IF NOT EXISTS request_inputs(
+          request_id INTEGER PRIMARY KEY REFERENCES requests(id) ON DELETE CASCADE,
+          payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS api_calls(
           id INTEGER PRIMARY KEY, request_id INTEGER REFERENCES requests(id) ON DELETE CASCADE,
           user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, day TEXT NOT NULL,
@@ -161,9 +164,10 @@ class DB:
     def reserve_call(self, rid, user_id, user_limit, global_limit):
         day = day_key()
         with self.tx() as c:
-            user_n = c.execute('SELECT COUNT(*) FROM api_calls WHERE user_id=? AND day=?', (user_id, day)).fetchone()[0]
+            user_n = c.execute('SELECT COUNT(DISTINCT request_id) FROM api_calls WHERE user_id=? AND day=?', (user_id, day)).fetchone()[0]
+            already = c.execute('SELECT 1 FROM api_calls WHERE request_id=? AND user_id=? AND day=?', (rid, user_id, day)).fetchone()
             total = c.execute('SELECT COUNT(*) FROM api_calls WHERE day=?', (day,)).fetchone()[0]
-            if user_n >= user_limit or total >= global_limit:
+            if (user_n >= user_limit and not already) or total >= global_limit:
                 return None
             return c.execute('INSERT INTO api_calls(request_id,user_id,day,created) VALUES(?,?,?,?)', (rid, user_id, day, time.time())).lastrowid
 
@@ -188,6 +192,15 @@ class DB:
         rows = self.rows('SELECT reply FROM requests WHERE id=? AND user_id=?', (rid, user_id))
         return rows[0]['reply'] if rows else None
 
+    def save_input(self, rid, message):
+        payload = {k: message[k] for k in ('text', 'caption', 'photo', 'document') if k in message}
+        with self.tx() as c:
+            c.execute('INSERT INTO request_inputs VALUES(?,?) ON CONFLICT(request_id) DO UPDATE SET payload=excluded.payload', (rid, json.dumps(payload, ensure_ascii=False)))
+
+    def saved_input(self, rid, user_id):
+        rows = self.rows('SELECT i.payload FROM request_inputs i JOIN requests r ON r.id=i.request_id WHERE r.id=? AND r.user_id=? AND r.reply IS NOT NULL', (rid, user_id))
+        return json.loads(rows[0]['payload']) if rows else None
+
     def counts(self, user_id=None):
         where, args = (' WHERE user_id=?', (user_id,)) if user_id is not None else ('', ())
         r = self.rows('''SELECT COUNT(*) requests, COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) success,
@@ -203,6 +216,7 @@ class DB:
 
     def cleanup(self):
         with self.tx() as c:
+            c.execute('DELETE FROM request_inputs WHERE request_id IN (SELECT id FROM requests WHERE created<?)', (time.time() - 7*86400,))
             c.execute('UPDATE requests SET reply=NULL,warning=NULL WHERE created<?', (time.time() - 7*86400,))
             c.execute("DELETE FROM updates WHERE status='done' AND created<?", (time.time() - 7*86400,))
             c.execute('DELETE FROM events WHERE created<?', (time.time() - 180*86400,))
