@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py *.txt ./
-ENV PYTHONUNBUFFERED=1 DB_PATH=/data/bot.sqlite3 PORT=8080
-EXPOSE 8080
+EXPOSE 10000
 CMD ["python", "app.py"]

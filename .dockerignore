@@ -1,0 +1,7 @@
+**/__pycache__
+.env
+credentials.json
+private_config
+data
+*.sqlite3*
+.git

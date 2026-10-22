@@ -26,7 +26,11 @@ PRIVACY = ('Сохраняются Telegram ID, имя, username, первый �
 
 class App:
     def __init__(self):
-        self.db = DB(os.getenv('DB_PATH', 'data/bot.sqlite3'))
+        if os.getenv('DATABASE_URL'):
+            from db_pg import DB as PostgresDB
+            self.db = PostgresDB()
+        else:
+            self.db = DB(os.getenv('DB_PATH', 'data/bot.sqlite3'))
         self.tg = Telegram(os.environ['BOT_TOKEN'])
         self.ai = Generator(os.environ['OPENAI_API_KEY'], os.getenv('OPENAI_MODEL', 'gpt-4.1-mini'))
         self.claim_code = os.getenv('ADMIN_CLAIM_CODE', '')
@@ -80,7 +84,7 @@ class App:
                 c.execute('UPDATE users SET blocked=? WHERE id=?',(int(cmd=='/block'),int(arg)))
             self.send(uid, 'Готово.')
         elif cmd == '/export':
-            rows = self.db.rows('''SELECT u.*,COUNT(r.id) requests,COALESCE(SUM(r.status='success'),0) success FROM users u LEFT JOIN requests r ON r.user_id=u.id GROUP BY u.id ORDER BY u.created DESC''')
+            rows = self.db.rows('''SELECT u.*,COUNT(r.id) requests,COALESCE(SUM(CASE WHEN r.status='success' THEN 1 ELSE 0 END),0) success FROM users u LEFT JOIN requests r ON r.user_id=u.id GROUP BY u.id ORDER BY u.created DESC''')
             out = io.StringIO()
             if rows:
                 writer = csv.DictWriter(out,fieldnames=list(rows[0]))
@@ -150,7 +154,8 @@ class App:
         if len(text)>16000:
             self.send(uid,'Сократите объявление до 16 000 символов.')
             return
-        self.db.request(rid,uid,'image' if photo or document else 'text')
+        if not self.db.request(rid,uid,'image' if photo or document else 'text'):
+            return
         try:
             images=[]
             if photo or document:
@@ -237,7 +242,15 @@ if __name__=='__main__':
     if os.getenv('SECRETS_FILE'):
         for k,v in json.loads(Path(os.environ['SECRETS_FILE']).read_text()).items():
             os.environ.setdefault(k,str(v))
-    try: App().run()
+    try:
+        mode = os.getenv('BOT_MODE', 'webhook' if os.getenv('DATABASE_URL') else 'polling')
+        if mode == 'webhook':
+            from webhook import WebhookApp
+            WebhookApp().run()
+        elif mode == 'polling':
+            App().run()
+        else:
+            raise ValueError('Unknown BOT_MODE')
     except Exception as e:
         log.error('Startup stopped: %s',type(e).__name__)
         raise SystemExit(1)

@@ -1,6 +1,7 @@
 import json
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from db import DB, source_of
 from ai import Generator, bounded, presentation
@@ -27,11 +28,8 @@ class Tests(unittest.TestCase):
         self.assertTrue(self.db.admin(7))
     def test_quota_atomic(self):
         self.db.request(1,7,'text')
-        results=[]
-        def call(): results.append(self.db.reserve_call(1,7,3,5))
-        threads=[threading.Thread(target=call) for _ in range(10)]
-        for t in threads:t.start()
-        for t in threads:t.join()
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            results=list(pool.map(lambda _: self.db.reserve_call(1,7,3,5),range(10)))
         self.assertEqual(sum(x is not None for x in results),3)
     def test_delete_and_copy_ownership(self):
         self.db.request(1,7,'text')

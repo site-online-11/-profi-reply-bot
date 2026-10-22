@@ -12,29 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
-def source_of(text):
-    parts = (text or '').split(maxsplit=1)
-    if not parts or parts[0].split('@')[0] != '/start' or len(parts) < 2:
-        return None
-    value = parts[1].strip()
-    if value.startswith('admin_'):
-        return None
-    return value if re.fullmatch(r'[A-Za-z0-9_-]{1,64}', value) else None
-
-
-def day_key():
-    return datetime.now(ZoneInfo('Europe/Moscow')).date().isoformat()
-
-
-class DB:
-    def __init__(self, path):
-        self.path = path
-        if path != ':memory:':
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.lock = threading.RLock()
-        self.c = sqlite3.connect(path, check_same_thread=False, timeout=30)
-        self.c.row_factory = sqlite3.Row
-        self.c.executescript('''
+SCHEMA = '''
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS users(
@@ -62,7 +40,32 @@ class DB:
         CREATE INDEX IF NOT EXISTS calls_day ON api_calls(day,user_id);
         CREATE INDEX IF NOT EXISTS updates_state ON updates(status,id);
         CREATE INDEX IF NOT EXISTS events_user ON events(user_id,created);
-        ''')
+        '''
+
+
+def source_of(text):
+    parts = (text or '').split(maxsplit=1)
+    if not parts or parts[0].split('@')[0] != '/start' or len(parts) < 2:
+        return None
+    value = parts[1].strip()
+    if value.startswith('admin_'):
+        return None
+    return value if re.fullmatch(r'[A-Za-z0-9_-]{1,64}', value) else None
+
+
+def day_key():
+    return datetime.now(ZoneInfo('Europe/Moscow')).date().isoformat()
+
+
+class DB:
+    def __init__(self, path):
+        self.path = path
+        if path != ':memory:':
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.c = sqlite3.connect(path, check_same_thread=False, timeout=30)
+        self.c.row_factory = sqlite3.Row
+        self.c.executescript(SCHEMA)
         self.c.commit()
 
     @contextlib.contextmanager
@@ -89,13 +92,13 @@ class DB:
             c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
 
     def ingest(self, updates):
-        """Save the batch BEFORE acknowledging it via the next Telegram offset."""
+        """Commit before acknowledging delivery; accept out-of-order webhook updates."""
         now = time.time()
         with self.tx() as c:
             offset = int(self.get('offset', '0'))
             for u in updates:
                 uid = int(u['update_id'])
-                if uid < offset or c.execute('SELECT 1 FROM updates WHERE id=?', (uid,)).fetchone():
+                if c.execute('SELECT 1 FROM updates WHERE id=?', (uid,)).fetchone():
                     continue
                 offset = max(offset, uid + 1)
                 cb = u.get('callback_query')
@@ -187,8 +190,8 @@ class DB:
 
     def counts(self, user_id=None):
         where, args = (' WHERE user_id=?', (user_id,)) if user_id is not None else ('', ())
-        r = self.rows('''SELECT COUNT(*) requests, COALESCE(SUM(status='success'),0) success,
-          COALESCE(SUM(status='error'),0) errors, COALESCE(SUM(classification='vacancy'),0) vacancies
+        r = self.rows('''SELECT COUNT(*) requests, COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) success,
+          COALESCE(SUM(CASE WHEN status='error' THEN 1 ELSE 0 END),0) errors, COALESCE(SUM(CASE WHEN classification='vacancy' THEN 1 ELSE 0 END),0) vacancies
           FROM requests''' + where, args)[0]
         r.update(self.rows('SELECT COUNT(*) api_calls,COALESCE(SUM(input_tokens),0) input_tokens,COALESCE(SUM(output_tokens),0) output_tokens FROM api_calls' + where, args)[0])
         return r
