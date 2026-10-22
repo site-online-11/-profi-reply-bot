@@ -96,6 +96,7 @@ class HandlerTests(unittest.TestCase):
         self.app.tg=Mock()
         self.app.ai=Mock()
         self.app.profile='Константин'
+        self.app.default_prompt='Исходный промпт'
         self.app.claim_code='secret'
         self.app.user_limit=60
         self.app.global_limit=300
@@ -155,4 +156,92 @@ class HandlerTests(unittest.TestCase):
         self.app.handle(update(text='ОГЭ'))
         self.assertEqual(self.app.ai.generate.call_count,1)
 
+    def make_admin(self):
+        with self.app.db.tx() as c:
+            c.execute('INSERT INTO admins VALUES(?)', (7,))
+
+    def admin_button(self, n, action, user=7):
+        return {'update_id':n,'callback_query':{'id':str(n),'from':{'id':user},'data':'admin:'+action,'message':{'chat':{'id':user,'type':'private'},'from':{'id':123,'is_bot':True}}}}
+
+    def test_prompt_editor_buttons_save_without_ai_and_use_new_prompt(self):
+        self.make_admin()
+        self.feed(update(text='/admin'))
+        self.assertIn('admin:prompt', str(self.app.tg.send.call_args))
+        self.feed(self.admin_button(2, 'edit_prompt'))
+        self.feed(update(3, text='Новый системный промпт <тест>'))
+        self.assertEqual(self.app.db.get('system_prompt'), 'Новый системный промпт <тест>')
+        self.assertEqual(self.app.db.get('prompt_edit:7'), '0')
+        self.app.ai.generate.assert_not_called()
+        self.assertEqual(self.app.db.counts(7)['requests'], 0)
+        captured=[]
+        def generate(*args, **kwargs):
+            captured.append(self.app.ai.prompt)
+            return {'kind':'lesson','reply':'Ответ','warning':''}
+        self.app.ai.generate.side_effect=generate
+        self.feed(update(4, text='Обучение C++'))
+        self.feed(self.admin_button(5, 'unused'))
+        cb=self.admin_button(6, 'unused')
+        cb['callback_query']['data']='emoji:4'
+        self.feed(cb)
+        self.assertEqual(captured, ['Новый системный промпт <тест>']*2)
+        self.feed(update(7, text='/prompt'))
+        self.assertEqual(self.app.tg.document.call_args.args[2], 'Новый системный промпт <тест>'.encode())
+
+    def test_prompt_commands_and_callbacks_require_admin(self):
+        for n,cmd in enumerate(('/set_prompt HACK','/edit_prompt','/prompt'),1):
+            self.feed(update(n, text=cmd))
+            self.assertIn('только администратору', self.app.tg.send.call_args.args[1])
+        self.feed(self.admin_button(4, 'confirm_reset_prompt'))
+        self.assertIsNone(self.app.db.get('system_prompt'))
+        self.app.tg.document.assert_not_called()
+
+    def test_prompt_file_and_validation(self):
+        self.make_admin()
+        self.feed(update(text='/edit_prompt'))
+        document=update(2, text='')
+        document['message']['document']={'file_id':'file','file_name':'prompt.txt'}
+        self.app.tg.text_file.return_value=''
+        self.feed(document)
+        self.assertIsNone(self.app.db.get('system_prompt'))
+        self.app.tg.text_file.return_value='Я'*6000
+        document['update_id']=3
+        self.feed(document)
+        self.assertEqual(self.app.db.get('system_prompt'), 'Я'*6000)
+        self.app.ai.generate.assert_not_called()
+
+    def test_prompt_reset_needs_confirmation_and_cancel_keeps_value(self):
+        self.make_admin()
+        self.feed(update(text='/set_prompt Особый промпт'))
+        self.feed(self.admin_button(2, 'reset_prompt'))
+        self.assertEqual(self.app.db.get('system_prompt'), 'Особый промпт')
+        self.feed(self.admin_button(3, 'cancel'))
+        self.assertEqual(self.app.db.get('system_prompt'), 'Особый промпт')
+        self.feed(self.admin_button(4, 'confirm_reset_prompt'))
+        self.assertEqual(self.app.db.get('system_prompt'), self.app.default_prompt)
+
+    def test_prompt_survives_database_reopen(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            path=str(Path(directory)/'bot.sqlite3')
+            self.app.db=DB(path)
+            self.make_admin()
+            self.feed(update(text='/set_prompt Сохрани меня'))
+            self.app.db.c.close()
+            self.app.db=DB(path)
+            self.assertEqual(self.app.db.get('system_prompt'), 'Сохрани меня')
+            self.app.db.c.close()
+
+    def test_prompt_rejects_oversized_text_and_cancel_restores_normal_input(self):
+        self.make_admin()
+        self.feed(update(text='/edit_prompt'))
+        self.feed(update(2, text='a'*20001))
+        self.assertIsNone(self.app.db.get('system_prompt'))
+        self.app.ai.generate.assert_not_called()
+        self.feed(update(3, text='/cancel'))
+        self.app.ai.generate.return_value={'kind':'lesson','reply':'Ответ','warning':''}
+        self.feed(update(4, text='ОГЭ'))
+        self.app.ai.generate.assert_called_once()
+
 if __name__=='__main__':unittest.main()
+

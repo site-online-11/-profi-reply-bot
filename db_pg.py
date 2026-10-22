@@ -136,3 +136,4 @@ class DB(SQLiteDB):
         with self.lock:
             self.ensure()
             return self.c.execute(sql, params).fetchall()
+

@@ -220,3 +220,4 @@ class DB:
             c.execute('UPDATE requests SET reply=NULL,warning=NULL WHERE created<?', (time.time() - 7*86400,))
             c.execute("DELETE FROM updates WHERE status='done' AND created<?", (time.time() - 7*86400,))
             c.execute('DELETE FROM events WHERE created<?', (time.time() - 180*86400,))
+

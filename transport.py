@@ -72,6 +72,28 @@ class Telegram:
             raise ValueError('Поддерживаются JPG, PNG и WEBP. HEIC отправьте как обычное фото.')
         return raw, mime
 
+    def text_file(self, document):
+        if not document.get('file_name', '').lower().endswith('.txt'):
+            raise ValueError('Expected a .txt file')
+        limit = 80000
+        if document.get('file_size', 0) > limit:
+            raise ValueError('File too large')
+        info = self.call('getFile', file_id=document['file_id'])
+        path = info.get('file_path', '')
+        if not path or '://' in path or '..' in path or info.get('file_size', 0) > limit:
+            raise ValueError('Invalid file')
+        try:
+            with urllib.request.urlopen(f'https://api.telegram.org/file/bot{self.token}/{path}', timeout=30) as response:
+                raw = response.read(limit + 1)
+        except (OSError, urllib.error.URLError):
+            raise APIError('telegram') from None
+        if len(raw) > limit:
+            raise ValueError('File too large')
+        try:
+            return raw.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            raise ValueError('Expected UTF-8') from None
+
     def document(self, chat_id, filename, raw):
         boundary = uuid.uuid4().hex
         body = (f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'
@@ -87,3 +109,4 @@ class Telegram:
                 return result['result']
         except (urllib.error.URLError, OSError):
             raise APIError('telegram') from None
+

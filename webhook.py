@@ -163,3 +163,4 @@ class WebhookApp(App):
                 self.db.release_worker()
             except Exception:
                 pass
+

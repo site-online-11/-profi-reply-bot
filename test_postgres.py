@@ -37,3 +37,4 @@ class PostgresTests(test_bot.Tests):
 
 if __name__ == '__main__':
     unittest.main()
+

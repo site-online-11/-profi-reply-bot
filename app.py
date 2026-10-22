@@ -31,6 +31,7 @@ class App:
             self.db = DB(os.getenv('DB_PATH', 'data/bot.sqlite3'))
         self.tg = Telegram(os.environ['BOT_TOKEN'])
         self.ai = Generator(os.environ['OPENAI_API_KEY'], os.getenv('OPENAI_MODEL', 'gpt-4.1-mini'))
+        self.default_prompt = self.ai.prompt
         self.claim_code = os.getenv('ADMIN_CLAIM_CODE', '')
         self.user_limit = int(os.getenv('USER_DAILY_LIMIT', '60'))
         self.global_limit = int(os.getenv('GLOBAL_DAILY_LIMIT', '300'))
@@ -49,10 +50,13 @@ class App:
         if not self.db.admin(uid):
             self.send(uid, 'Доступ только администратору.')
             return
+        if cmd in ('/prompt', '/edit_prompt', '/set_prompt', '/reset_prompt', '/confirm_reset_prompt', '/cancel'):
+            self.prompt_admin(uid, cmd, arg)
+            return
         if cmd in ('/admin', '/stats'):
             n = self.db.rows('SELECT COUNT(*) n FROM users')[0]['n']
             c = self.db.counts()
-            self.send(uid, f"Пользователи: {n}\nЗапросы: {c['requests']}\nУспешно: {c['success']}\nОшибки: {c['errors']}\nВакансии: {c['vacancies']}\nВызовы ИИ: {c['api_calls']}\nТокены вход/выход: {c['input_tokens']}/{c['output_tokens']}\n\n/users — пользователи\n/user ID — карточка\n/sources — источники\n/source название — рекламная ссылка\n/export — CSV\n/profile — профиль преподавателя\n/set_profile текст — заменить профиль\n/block ID, /unblock ID", [[{'text':'Пользователи','callback_data':'admin:users:0'},{'text':'Источники','callback_data':'admin:sources'}]])
+            self.send(uid, f"Пользователи: {n}\nЗапросы: {c['requests']}\nУспешно: {c['success']}\nОшибки: {c['errors']}\nВакансии: {c['vacancies']}\nВызовы ИИ: {c['api_calls']}\nТокены вход/выход: {c['input_tokens']}/{c['output_tokens']}\n\n/users — пользователи\n/user ID — карточка\n/sources — источники\n/source название — рекламная ссылка\n/export — CSV\n/profile — профиль преподавателя\n/set_profile текст — заменить профиль\n/prompt — системный промпт\n/block ID, /unblock ID", [[{'text':'Пользователи','callback_data':'admin:users:0'},{'text':'Источники','callback_data':'admin:sources'}], [{'text':'Системный промпт','callback_data':'admin:prompt'}]])
         elif cmd == '/users':
             page = max(0, int(arg or '0'))
             rows = self.db.rows('SELECT * FROM users ORDER BY created DESC LIMIT 10 OFFSET ?', (page*10,))
@@ -92,6 +96,47 @@ class App:
                     writer.writerow({k: ("'"+v if isinstance(v,str) and v[:1] in ('=','+','-','@','\t','\r') else v) for k,v in r.items()})
             self.tg.document(uid,'users.csv',('\ufeff'+out.getvalue()).encode())
 
+    def prompt_admin(self, uid, cmd, arg=''):
+        # This method is also used by the message editor: check permissions here too.
+        if not self.db.admin(uid):
+            self.send(uid, 'Доступ только администратору.')
+            return
+        edit_key = f'prompt_edit:{uid}'
+        buttons = [[{'text':'Изменить промпт','callback_data':'admin:edit_prompt'}],
+                   [{'text':'Сбросить к исходному','callback_data':'admin:reset_prompt'}]]
+        if cmd == '/prompt':
+            current = self.db.get('system_prompt', self.default_prompt)
+            self.tg.document(uid, 'system-prompt.txt', current.encode('utf-8'))
+            # Keep each block below Telegram's UTF-16 message limit, including emoji.
+            if len(current) <= 1500:
+                self.send(uid, '<pre>' + html.escape(current) + '</pre>', formatted=True)
+            self.send(uid, 'Это текущий системный промпт. Изменения применяются к следующим откликам без перезапуска. Лимит ответа — 500 символов.', buttons)
+        elif cmd == '/edit_prompt' or (cmd == '/set_prompt' and not arg):
+            self.db.set(edit_key, time.time() + 1800)
+            self.send(uid, 'Пришлите новый промпт одним текстовым сообщением или файлом .txt (до 20 000 символов). Я сразу сохраню его. Ожидание — 30 минут. Отмена: /cancel.', [[{'text':'Отмена','callback_data':'admin:cancel'}]])
+        elif cmd == '/cancel':
+            self.db.set(edit_key, '0')
+            self.send(uid, 'Редактирование отменено. Промпт не изменён.')
+        elif cmd == '/reset_prompt':
+            self.send(uid, 'Вернуть исходный промпт из кода бота?', [[{'text':'Да, сбросить','callback_data':'admin:confirm_reset_prompt'}, {'text':'Отмена','callback_data':'admin:cancel'}]])
+        elif cmd == '/confirm_reset_prompt':
+            self.save_prompt(uid, self.default_prompt)
+        elif cmd == '/set_prompt':
+            self.save_prompt(uid, arg)
+
+    def save_prompt(self, uid, text):
+        if not self.db.admin(uid):
+            self.send(uid, 'Доступ только администратору.')
+            return
+        text = text.strip()
+        if not text or len(text) > 20000:
+            self.send(uid, 'Промпт должен содержать от 1 до 20 000 символов. Пришлите его снова или нажмите /cancel.')
+            return
+        with self.db.tx() as c:
+            c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ('system_prompt', text))
+            c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (f'prompt_edit:{uid}', '0'))
+        self.send(uid, f'Промпт сохранён ({len(text)} символов). Он применяется ко всем следующим откликам, включая варианты. Лимит ответа — 500 символов.', [[{'text':'Посмотреть промпт','callback_data':'admin:prompt'}]])
+
     def handle(self, u):
         cb = u.get('callback_query')
         m = u.get('message') or cb['message']
@@ -125,6 +170,19 @@ class App:
                 self.admin_panel(uid,'/'+parts[1],parts[2] if len(parts)>2 else '')
             return
         text=m.get('text','')
+        editing = float(self.db.get(f'prompt_edit:{uid}', '0')) > time.time()
+        if editing and not text.startswith('/') and self.db.admin(uid):
+            if m.get('document'):
+                try:
+                    text = self.tg.text_file(m['document'])
+                except (ValueError, APIError):
+                    self.send(uid, 'Не удалось прочитать файл. Пришлите .txt в UTF-8 до 80 КБ или текст одним сообщением. Отмена: /cancel.')
+                    return
+            elif not text:
+                self.send(uid, 'Ожидаю текст промпта или файл .txt. Чтобы отправить объявление, нажмите /cancel.')
+                return
+            self.save_prompt(uid, text)
+            return
         if text.startswith('/'):
             parts=text.split(maxsplit=1)
             cmd=parts[0].split('@')[0].lower()
@@ -142,7 +200,7 @@ class App:
                 self.send(uid,f"Запросов: {c['requests']}\nОтветов: {c['success']}\nВызовов ИИ: {c['api_calls']}\nДневной лимит: {self.user_limit} запросов (включая варианты).")
             elif cmd=='/delete_data':
                 self.send(uid,'Удалить ваши данные и сохранённые ответы?',[[{'text':'Да, удалить','callback_data':'delete:yes'}]])
-            elif cmd in ('/admin','/stats','/users','/user','/sources','/source','/export','/profile','/set_profile','/block','/unblock'):
+            elif cmd in ('/admin','/stats','/users','/user','/sources','/source','/export','/profile','/set_profile','/block','/unblock','/prompt','/edit_prompt','/set_prompt','/reset_prompt','/cancel'):
                 self.admin_panel(uid,cmd,arg)
             else: self.send(uid,'Неизвестная команда. /help')
             return
@@ -180,6 +238,7 @@ class App:
                     raise ValueError('Изображение больше 10 МБ. Пришлите его как фото.')
                 images=[self.tg.file(file['file_id'])]
             self.tg.call('sendChatAction',chat_id=uid,action='typing')
+            self.ai.prompt = self.db.get('system_prompt', self.default_prompt)
             result=self.ai.generate(text or m.get('caption',''),images,self.db.get('profile',self.profile),lambda:self.db.reserve_call(rid,uid,self.user_limit,self.global_limit),self.db.call_done,style=u.get('variant'),previous=u.get('previous_reply'))
             self.db.result(rid,result)
             body,kb=presentation(result,rid)
@@ -270,3 +329,4 @@ if __name__=='__main__':
     except Exception as e:
         log.error('Startup stopped: %s',type(e).__name__)
         raise SystemExit(1)
+
